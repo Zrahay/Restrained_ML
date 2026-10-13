@@ -1,152 +1,212 @@
 package com.zrahay.restrainedml
 
+import android.Manifest
 import android.app.Activity
-import android.graphics.BitmapFactory
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Bundle
-import android.util.Log
+import android.provider.MediaStore
+import android.util.LruCache
+import android.util.Size
 import android.view.Gravity
-import android.widget.ScrollView
+import android.view.View
+import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
+import android.widget.BaseAdapter
+import android.widget.EditText
+import android.widget.GridView
+import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.TextView
-import org.json.JSONObject
 import org.pytorch.executorch.EValue
 import org.pytorch.executorch.Module
 import org.pytorch.executorch.Tensor
 import java.io.File
+import java.util.concurrent.Executors
 import kotlin.math.sqrt
-import kotlin.system.measureTimeMillis
 
-private const val TAG = "RestrainedML"
+private const val PERMISSION_REQUEST = 1
+private const val EMBEDDING_DIM = 512
+private const val TOP_K = 30
 
 class MainActivity : Activity() {
 
+    private lateinit var searchBox: EditText
     private lateinit var statusView: TextView
-    private val report = StringBuilder()
+    private lateinit var grid: GridView
+    private val gridAdapter = ResultsAdapter()
+
+    private var tokenizer: ClipTokenizer? = null
+    private var textModule: Module? = null
+    private var store: EmbeddingStore? = null
+
+    private val thumbExecutor = Executors.newFixedThreadPool(3)
+    private val thumbCache = LruCache<Long, Bitmap>(120)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        buildUi()
+        if (checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            start()
+        } else {
+            requestPermissions(arrayOf(Manifest.permission.READ_MEDIA_IMAGES), PERMISSION_REQUEST)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        code: Int, permissions: Array<String>, results: IntArray
+    ) {
+        if (code == PERMISSION_REQUEST && results.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            start()
+        } else {
+            status("Photo permission denied — nothing to search. Grant it in Settings.")
+        }
+    }
+
+    private fun buildUi() {
+        searchBox = EditText(this).apply {
+            hint = "Search your photos…  e.g. man in black shirt"
+            isSingleLine = true
+            imeOptions = EditorInfo.IME_ACTION_SEARCH
+            setOnEditorActionListener { _, action, _ ->
+                if (action == EditorInfo.IME_ACTION_SEARCH) {
+                    search(text.toString()); true
+                } else false
+            }
+            isEnabled = false
+        }
         statusView = TextView(this).apply {
-            text = "Running Phase D checks…"
-            textSize = 14f
-            gravity = Gravity.START
-            setPadding(32, 64, 32, 64)
+            text = "Loading…"
+            setPadding(16, 8, 16, 8)
         }
-        setContentView(ScrollView(this).apply { addView(statusView) })
-
-        Thread { runPhaseD() }.start()
+        grid = GridView(this).apply {
+            numColumns = 3
+            horizontalSpacing = 8
+            verticalSpacing = 8
+            adapter = gridAdapter
+            setOnItemClickListener { _, _, pos, _ -> openPhoto(gridAdapter.items[pos].first) }
+        }
+        setContentView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 32, 16, 0)
+            addView(searchBox)
+            addView(statusView)
+            addView(grid, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        })
     }
 
-    private fun runPhaseD() {
-        try {
-            // --- Suite 1: tokenizer IDs vs Python (50 cases) ---
-            line("Loading tokenizer…")
-            val tokenizer: ClipTokenizer
-            val tokLoadMs = measureTimeMillis {
-                tokenizer = ClipTokenizer(readAsset("clip_tokenizer.json"))
-            }
-            line("Tokenizer loaded in $tokLoadMs ms")
+    private fun start() {
+        status("Loading models…")
+        Thread {
+            val tok = ClipTokenizer(assets.open("clip_tokenizer.json").bufferedReader().readText())
+            val text = Module.load(extractAsset("mobileclip_text.pte"))
+            val st = EmbeddingStore(File(filesDir, "index.bin"), EMBEDDING_DIM)
+            tokenizer = tok; textModule = text; store = st
 
-            val tokGolden = JSONObject(readAsset("tokenizer_golden.json"))
-                .getJSONArray("cases")
-            var tokFails = 0
-            for (i in 0 until tokGolden.length()) {
-                val case = tokGolden.getJSONObject(i)
-                val query = case.getString("query")
-                val expectedJson = case.getJSONArray("tokens")
-                val expected = LongArray(expectedJson.length()) { expectedJson.getLong(it) }
-                val actual = tokenizer.tokenize(query)
-                if (!expected.contentEquals(actual)) {
-                    tokFails++
-                    line("TOKENIZER MISMATCH: \"$query\"")
-                    line("  expected: ${expected.take(12)}…")
-                    line("  actual:   ${actual.take(12)}…")
+            runOnUiThread {
+                searchBox.isEnabled = true
+                status("Ready — ${st.size()} photos indexed. Indexing new ones…")
+            }
+
+            // Index in the background; search works on whatever is ready
+            val image = Module.load(extractAsset("mobileclip_image.pte"))
+            val indexer = GalleryIndexer(this, st, image)
+            var lastShown = -1
+            indexer.indexAll { done, total ->
+                if (done == total || done - lastShown >= 5) {
+                    lastShown = done
+                    runOnUiThread {
+                        status(
+                            if (done == total)
+                                "Indexed ${st.size()} photos" +
+                                    (if (indexer.failed > 0) " (${indexer.failed} failed)" else "")
+                            else
+                                "Indexing… $done/$total new photos (searchable: ${st.size()})"
+                        )
+                    }
                 }
             }
-            line("Suite 1 tokenizer: ${tokGolden.length() - tokFails}/${tokGolden.length()} exact matches")
-
-            // --- Suite 2: string -> Kotlin tokenizer -> text encoder (end to end) ---
-            val textModule = loadModule("mobileclip_text.pte")
-            line("Text encoder loaded")
-            val textGolden = JSONObject(readAsset("golden_text.json")).getJSONArray("cases")
-            var textFails = 0
-            for (i in 0 until textGolden.length()) {
-                val case = textGolden.getJSONObject(i)
-                val query = case.getString("query")
-                val expected = floatArray(case, "embedding")
-                val tokens = tokenizer.tokenize(query)
-                val input = Tensor.fromBlob(tokens, longArrayOf(1, tokens.size.toLong()))
-                val output = textModule.forward(EValue.from(input))[0]
-                    .toTensor().dataAsFloatArray
-                val cos = cosine(expected, output)
-                val ok = cos >= 0.999f
-                if (!ok) textFails++
-                line("text \"$query\": cosine=%.6f %s".format(cos, if (ok) "OK" else "FAIL"))
-            }
-
-            // --- Suite 3: jpg -> Kotlin preprocess -> image encoder (end to end) ---
-            val imageModule = loadModule("mobileclip_image.pte")
-            line("Image encoder loaded")
-            val imgGolden = JSONObject(readAsset("golden_images.json")).getJSONArray("cases")
-            var imgFails = 0
-            for (i in 0 until imgGolden.length()) {
-                val case = imgGolden.getJSONObject(i)
-                val file = case.getString("file")
-                val expected = floatArray(case, "embedding")
-                val bitmap = assets.open(file).use { BitmapFactory.decodeStream(it) }
-                val data = ImagePreprocessor.toTensorData(bitmap)
-                val input = Tensor.fromBlob(
-                    data, longArrayOf(1, 3, ImagePreprocessor.SIZE.toLong(), ImagePreprocessor.SIZE.toLong())
-                )
-                var output: FloatArray
-                val ms = measureTimeMillis {
-                    output = imageModule.forward(EValue.from(input))[0]
-                        .toTensor().dataAsFloatArray
-                }
-                val cos = cosine(expected, output)
-                val ok = cos >= 0.99f // preprocessing is approximate (resize filters differ)
-                if (!ok) imgFails++
-                line("image $file: cosine=%.6f  %d ms %s".format(cos, ms, if (ok) "OK" else "FAIL"))
-            }
-
-            val total = tokFails + textFails + imgFails
-            line(
-                if (total == 0) "\nPHASE D PASSED — tokenizer + preprocessing match desktop"
-                else "\nPHASE D FAILED: $tokFails tokenizer, $textFails text, $imgFails image"
-            )
-        } catch (e: Throwable) {
-            Log.e(TAG, "Phase D crashed", e)
-            line("ERROR: $e")
-        }
+            if (indexer.galleryIds().isEmpty()) runOnUiThread { status("No photos found in gallery") }
+        }.start()
     }
 
-    private fun readAsset(name: String): String =
-        assets.open(name).bufferedReader().readText()
+    private fun search(query: String) {
+        val tok = tokenizer ?: return
+        val text = textModule ?: return
+        val st = store ?: return
+        if (query.isBlank() || st.size() == 0) return
+        Thread {
+            val tokens = tok.tokenize(query)
+            val input = Tensor.fromBlob(tokens, longArrayOf(1, tokens.size.toLong()))
+            val raw = text.forward(EValue.from(input))[0].toTensor().dataAsFloatArray
+            var norm = 0f
+            for (v in raw) norm += v * v
+            norm = sqrt(norm)
+            val queryEmb = FloatArray(raw.size) { raw[it] / norm }
 
-    private fun loadModule(assetName: String): Module {
-        val file = File(filesDir, assetName)
+            val results = st.search(queryEmb, TOP_K)
+            runOnUiThread {
+                gridAdapter.items = results
+                gridAdapter.notifyDataSetChanged()
+                status("\"$query\" — top ${results.size} of ${st.size()} photos")
+            }
+        }.start()
+    }
+
+    private fun openPhoto(id: Long) {
+        val uri = Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString())
+        startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+    }
+
+    private fun extractAsset(name: String): String {
+        val file = File(filesDir, name)
         if (!file.exists() || file.length() == 0L) {
-            assets.open(assetName).use { input ->
-                file.outputStream().use { input.copyTo(it) }
+            assets.open(name).use { input -> file.outputStream().use { input.copyTo(it) } }
+        }
+        return file.absolutePath
+    }
+
+    private fun status(text: String) {
+        runOnUiThread { statusView.text = text }
+    }
+
+    private inner class ResultsAdapter : BaseAdapter() {
+        var items: List<Pair<Long, Float>> = emptyList()
+
+        override fun getCount() = items.size
+        override fun getItem(position: Int) = items[position]
+        override fun getItemId(position: Int) = items[position].first
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val size = parent.width / 3 - 8
+            val view = (convertView as? ImageView) ?: ImageView(this@MainActivity).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
             }
+            view.layoutParams = ViewGroup.LayoutParams(size, size)
+            val id = items[position].first
+            view.tag = id
+            val cached = thumbCache.get(id)
+            if (cached != null) {
+                view.setImageBitmap(cached)
+            } else {
+                view.setImageDrawable(null)
+                thumbExecutor.execute {
+                    try {
+                        val uri = Uri.withAppendedPath(
+                            MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString()
+                        )
+                        val thumb = contentResolver.loadThumbnail(uri, Size(256, 256), null)
+                        thumbCache.put(id, thumb)
+                        runOnUiThread { if (view.tag == id) view.setImageBitmap(thumb) }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            return view
         }
-        return Module.load(file.absolutePath)
-    }
-
-    private fun floatArray(obj: JSONObject, key: String): FloatArray {
-        val arr = obj.getJSONArray(key)
-        return FloatArray(arr.length()) { arr.getDouble(it).toFloat() }
-    }
-
-    private fun cosine(a: FloatArray, b: FloatArray): Float {
-        var dot = 0f; var na = 0f; var nb = 0f
-        for (i in a.indices) {
-            dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]
-        }
-        return dot / (sqrt(na) * sqrt(nb))
-    }
-
-    private fun line(text: String) {
-        Log.i(TAG, text)
-        report.appendLine(text)
-        runOnUiThread { statusView.text = report.toString() }
     }
 }
