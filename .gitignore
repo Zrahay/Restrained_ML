@@ -5,6 +5,7 @@ ml/data/images/
 # Model checkpoints and generated artifacts
 ml/models/*.pt
 ml/models/*.pte
+ml/export/*.pte
 
 # Python
 __pycache__/
