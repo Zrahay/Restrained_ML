@@ -68,8 +68,12 @@ class MainActivity : Activity() {
     }
 
     private fun buildUi() {
+        // Explicit colors: with no declared theme, dark mode gives light text
+        // on a light window — an invisible UI. Pin them instead.
         searchBox = EditText(this).apply {
             hint = "Search your photos…  e.g. man in black shirt"
+            setTextColor(0xFF111111.toInt())
+            setHintTextColor(0xFF888888.toInt())
             isSingleLine = true
             imeOptions = EditorInfo.IME_ACTION_SEARCH
             setOnEditorActionListener { _, action, _ ->
@@ -81,6 +85,7 @@ class MainActivity : Activity() {
         }
         statusView = TextView(this).apply {
             text = "Loading…"
+            setTextColor(0xFF444444.toInt())
             setPadding(16, 8, 16, 8)
         }
         grid = GridView(this).apply {
@@ -90,13 +95,21 @@ class MainActivity : Activity() {
             adapter = gridAdapter
             setOnItemClickListener { _, _, pos, _ -> openPhoto(gridAdapter.items[pos].first) }
         }
-        setContentView(LinearLayout(this).apply {
+        val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            setBackgroundColor(0xFFF5F5F5.toInt())
             setPadding(16, 32, 16, 0)
             addView(searchBox)
             addView(statusView)
             addView(grid, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
-        })
+        }
+        // targetSdk 35 forces edge-to-edge: pad content below the system bars
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars())
+            v.setPadding(16, bars.top + 16, 16, bars.bottom)
+            insets
+        }
+        setContentView(root)
     }
 
     private fun start() {

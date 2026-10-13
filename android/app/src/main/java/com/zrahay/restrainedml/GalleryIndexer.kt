@@ -66,10 +66,12 @@ class GalleryIndexer(
         val uri = Uri.withAppendedPath(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString()
         )
+        // Bounds probe: with inJustDecodeBounds the decode itself always
+        // returns null — success is signaled through bounds.outWidth/Height
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        context.contentResolver.openInputStream(uri)?.use {
-            BitmapFactory.decodeStream(it, null, bounds)
-        } ?: return null
+        val probe = context.contentResolver.openInputStream(uri) ?: return null
+        probe.use { BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
         var sample = 1
         val minSide = minOf(bounds.outWidth, bounds.outHeight)
