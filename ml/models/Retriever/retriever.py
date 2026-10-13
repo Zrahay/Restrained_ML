@@ -5,17 +5,19 @@ Run: python ml/models/Retriever/retriever.py --query "a red dress"
 """
 
 import argparse
+from pathlib import Path
 
 import mobileclip
 import torch
 
-embeddings_file = "ml/models/embeddings.pt"
-checkpoint = "ml/models/mobileclip_s1.pt"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+embeddings_file = REPO_ROOT / "ml" / "models" / "embeddings.pt"
+checkpoint = REPO_ROOT / "ml" / "models" / "mobileclip_s1.pt"
 model_name = "mobileclip_s1"
 top_k = 5
 
 model, _, preprocess = mobileclip.create_model_and_transforms(
-    model_name, pretrained=checkpoint
+    model_name, pretrained=str(checkpoint)
 )
 model.eval()
 tokenizer = mobileclip.get_tokenizer(model_name)
@@ -26,7 +28,8 @@ filenames = data["filenames"]
 
 
 def retrieve(query: str, k: int = top_k):
-    with torch.no_grad():
+    k = min(k, len(filenames))  # topk crashes if k exceeds the index size
+    with torch.inference_mode():
         tokens = tokenizer([query])
         text_features = model.encode_text(tokens)
         text_features = torch.nn.functional.normalize(text_features, dim=-1)

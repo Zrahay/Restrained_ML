@@ -1,0 +1,12 @@
+# Datasets (rebuild with: python ml/data/load_dataset.py)
+ml/data/fashionpedia_5k/
+ml/data/images/
+
+# Model checkpoints and generated artifacts
+ml/models/*.pt
+ml/models/*.pte
+
+# Python
+__pycache__/
+*.pyc
+.venv/
