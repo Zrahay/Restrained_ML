@@ -11,3 +11,9 @@ ml/export/*.pte
 __pycache__/
 *.pyc
 .venv/
+
+# Android
+android/local.properties
+android/.gradle/
+android/build/
+android/app/build/
