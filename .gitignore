@@ -13,6 +13,7 @@ __pycache__/
 .venv/
 
 # Android
+android/app/src/main/assets/*.pte
 android/local.properties
 android/.gradle/
 android/build/

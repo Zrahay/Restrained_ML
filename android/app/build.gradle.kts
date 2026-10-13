@@ -22,4 +22,13 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    androidResources {
+        // Keep .pte uncompressed in the APK so the runtime can map it directly
+        noCompress += "pte"
+    }
+}
+
+dependencies {
+    implementation("org.pytorch:executorch-android:1.5.1")
 }
